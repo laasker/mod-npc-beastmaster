@@ -97,6 +97,7 @@ enum PetGossip {
   PET_PAGE_START_RARE_PETS = 701,
   PET_PAGE_START_RARE_EXOTIC_PETS = 801,
   PET_PAGE_MAX = 901,
+  PET_CREATE_OFFSET = 100000,
   PET_MAIN_MENU = 50,
   PET_REMOVE_SKILLS = 80,
   PET_GOSSIP_HELLO = 601026,
@@ -657,7 +658,7 @@ void NpcBeastmaster::GossipSelect(Player *player, Creature *creature,
     return;
   }
 
-  if (action >= PET_PAGE_MAX)
+  if (action >= PET_CREATE_OFFSET)
     CreatePet(player, creature, action);
 }
 
@@ -666,7 +667,7 @@ void NpcBeastmaster::CreatePet(Player *player, Creature *creature,
   if (!sConfigMgr->GetOption<bool>("BeastMaster.Enable", true))
     return;
 
-  uint32 petEntry = action - PET_PAGE_MAX;
+  uint32 petEntry = action - PET_CREATE_OFFSET;
   const PetInfo *info = FindPetInfo(petEntry);
 
   if (player->IsExistPet()) {
@@ -763,7 +764,7 @@ void NpcBeastmaster::AddPetsToGossip(Player *player,
                          0); // 0 = no action
       } else {
         AddGossipItemFor(player, pet.icon, pet.name, GOSSIP_SENDER_MAIN,
-                         pet.entry + PET_PAGE_MAX);
+                         pet.entry + PET_CREATE_OFFSET);
       }
     }
     count++;
@@ -1079,9 +1080,46 @@ bool BeastMaster_CommandScript::HandleBeastmasterCommand(
 class BeastmasterLoginNotice_PlayerScript : public PlayerScript {
 public:
   BeastmasterLoginNotice_PlayerScript()
-      : PlayerScript("BeastmasterLoginNotice_PlayerScript") {}
+      : PlayerScript("BeastmasterLoginNotice_PlayerScript", {PLAYERHOOK_ON_LOGIN}) {}
 
-  void OnLogin(Player *player) {
+  void OnPlayerLogin(Player *player) override {
+    if (sConfigMgr->GetOption<bool>("BeastMaster.Enable", true)) {
+      // Fix for non-hunters losing pet spells on login due to core spell validation
+      if (player->getClass() != CLASS_HUNTER) {
+        QueryResult res = CharacterDatabase.Query(
+            "SELECT 1 FROM character_pet WHERE owner = {}", player->GetGUID().GetCounter());
+        
+        bool trackTamed = sConfigMgr->GetOption<bool>("BeastMaster.TrackTamedPets", false);
+        QueryResult res2;
+        if (trackTamed) {
+            res2 = CharacterDatabase.Query(
+                "SELECT 1 FROM beastmaster_tamed_pets WHERE owner_guid = {}", player->GetGUID().GetCounter());
+        }
+
+        if (res || res2) {
+            // Delete from DB to prevent duplicate key errors on save. The core marked these as 
+            // removed in-memory during load but hasn't deleted them from the DB yet.
+            CharacterDatabase.Execute(
+                "DELETE FROM character_spell WHERE guid = {} AND spell IN "
+                "(883, 982, 2641, 6991, 48990, 1002, 1462, 6197, 53270)",
+                player->GetGUID().GetCounter());
+
+            for (uint32 spell : HunterSpells) {
+                if (!player->HasSpell(spell)) {
+                    player->learnSpell(spell, false);
+                }
+            }
+
+            if (sConfigMgr->GetOption<bool>("BeastMaster.AllowExotic", false) || 
+                player->HasTalent(PET_SPELL_BEAST_MASTERY, player->GetActiveSpec())) {
+                if (!player->HasSpell(PET_SPELL_BEAST_MASTERY)) {
+                    player->learnSpell(PET_SPELL_BEAST_MASTERY, false);
+                }
+            }
+        }
+      }
+    }
+
     if (!sConfigMgr->GetOption<bool>("BeastMaster.ShowLoginNotice", true))
       return;
 
