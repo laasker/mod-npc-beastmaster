@@ -67,13 +67,9 @@ std::vector<uint32> HunterSpells = {883,   982,  2641, 6991,
 using PetList = std::vector<PetInfo>;
 
 PetList allPets;
-PetList normalPets;
 PetList exoticPets;
 PetList rarePets;
 PetList rareExoticPets;
-
-std::set<uint32> rarePetEntries;
-std::set<uint32> rareExoticPetEntries;
 
 // Cached config options for performance and consistency.
 struct BeastmasterConfig {
@@ -215,19 +211,6 @@ static bool IsValidPetName(const std::string &name) {
   return std::regex_match(name, allowed);
 }
 
-static std::set<uint32> ParseEntryList(const std::string &csv) {
-  std::set<uint32> result;
-  std::stringstream ss(csv);
-  std::string item;
-  while (std::getline(ss, item, ',')) {
-    try {
-      result.insert(std::stoul(item));
-    } catch (...) {
-    }
-  }
-  return result;
-}
-
 static const PetInfo *FindPetInfo(uint32 entry) {
   std::lock_guard<std::mutex> lock(petsMutex);
   auto it = allPetsByEntry.find(entry);
@@ -281,13 +264,7 @@ void NpcBeastmaster::LoadSystem(bool /*reload = false*/) {
   beastmasterConfig.allowedClasses = ParseAllowedClasses(
       sConfigMgr->GetOption<std::string>("BeastMaster.AllowedClasses", "0"));
 
-  rarePetEntries = ParseEntryList(
-      sConfigMgr->GetOption<std::string>("BeastMaster.RarePets", ""));
-  rareExoticPetEntries = ParseEntryList(
-      sConfigMgr->GetOption<std::string>("BeastMaster.RareExoticPets", ""));
-
   allPets.clear();
-  normalPets.clear();
   exoticPets.clear();
   rarePets.clear();
   rareExoticPets.clear();
@@ -296,11 +273,13 @@ void NpcBeastmaster::LoadSystem(bool /*reload = false*/) {
   QueryResult result = WorldDatabase.Query(
       "SELECT entry, name, family, rarity FROM beastmaster_tames");
   if (!result) {
-    LOG_ERROR(
-        "module",
-        "Beastmaster: Could not load tames from beastmaster_tames table!");
+    LOG_ERROR("module",
+              "Beastmaster: Could not load tames from beastmaster_tames table!");
     return;
   }
+
+  static std::set<uint32> const trainerIconFamilies = {
+      1, 2, 3, 4, 7, 8, 9, 10, 15, 20, 21, 30, 24, 31, 25, 34, 27};
 
   do {
     Field *fields = result->Fetch();
@@ -310,26 +289,53 @@ void NpcBeastmaster::LoadSystem(bool /*reload = false*/) {
     info.family = fields[2].Get<uint32>();
     info.rarity = fields[3].Get<std::string>();
 
-    static const std::set<uint32> TrainerIconFamilies = {
-        1, 2, 3, 4, 7, 8, 9, 10, 15, 20, 21, 30, 24, 31, 25, 34, 27};
-
-    if (TrainerIconFamilies.count(info.family))
-      info.icon = GOSSIP_ICON_TRAINER;
-    else
-      info.icon = GOSSIP_ICON_VENDOR;
-
-    allPets.push_back(info);
+    info.icon = trainerIconFamilies.count(info.family) ? GOSSIP_ICON_TRAINER
+                                                       : GOSSIP_ICON_VENDOR;
     allPetsByEntry[info.entry] = info;
-
-    if (rarePetEntries.count(info.entry))
-      rarePets.push_back(info);
-    else if (rareExoticPetEntries.count(info.entry))
-      rareExoticPets.push_back(info);
-    else if (info.rarity == "exotic")
-      exoticPets.push_back(info);
-    else
-      normalPets.push_back(info);
   } while (result->NextRow());
+
+  auto const loadConfiguredPets = [&](std::string const &option,
+                                      PetList &pets) {
+    pets.clear();
+    std::stringstream stream(sConfigMgr->GetOption<std::string>(option, ""));
+    std::string petName;
+    std::string entryText;
+
+    while (std::getline(stream, petName, ',')) {
+      if (!std::getline(stream, entryText, ',')) {
+        LOG_WARN("module",
+                 "Beastmaster: Missing entry ID for pet '{}' in {}.",
+                 petName, option);
+        break;
+      }
+
+      uint32 entry;
+      try {
+        entry = std::stoul(entryText);
+      } catch (std::exception const &) {
+        LOG_WARN("module", "Beastmaster: Invalid entry ID '{}' in {}.",
+                 entryText, option);
+        continue;
+      }
+
+      auto const pet = allPetsByEntry.find(entry);
+      if (pet == allPetsByEntry.end()) {
+        LOG_WARN("module",
+                 "Beastmaster: Pet entry {} from {} is not in beastmaster_tames.",
+                 entry, option);
+        continue;
+      }
+
+      PetInfo configuredPet = pet->second;
+      configuredPet.name = petName;
+      pets.push_back(std::move(configuredPet));
+    }
+  };
+
+  loadConfiguredPets("BeastMaster.Pets", allPets);
+  loadConfiguredPets("BeastMaster.ExoticPets", exoticPets);
+  loadConfiguredPets("BeastMaster.RarePets", rarePets);
+  loadConfiguredPets("BeastMaster.RareExoticPets", rareExoticPets);
 }
 
 void NpcBeastmaster::ShowMainMenu(Player *player, Creature *creature) {
@@ -462,8 +468,8 @@ void NpcBeastmaster::GossipSelect(Player *player, Creature *creature,
     AddGossipItemFor(player, GOSSIP_ICON_TALK, "Back..", GOSSIP_SENDER_MAIN,
                      PET_MAIN_MENU);
     int page = action - PET_PAGE_START_PETS + 1;
-    int maxPage = normalPets.size() / PET_PAGE_SIZE +
-                  (normalPets.size() % PET_PAGE_SIZE != 0);
+    int maxPage = allPets.size() / PET_PAGE_SIZE +
+                  (allPets.size() % PET_PAGE_SIZE != 0);
 
     if (page > 1)
       AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Previous..",
@@ -473,7 +479,7 @@ void NpcBeastmaster::GossipSelect(Player *player, Creature *creature,
       AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, "Next..",
                        GOSSIP_SENDER_MAIN, PET_PAGE_START_PETS + page);
 
-    AddPetsToGossip(player, normalPets, page);
+    AddPetsToGossip(player, allPets, page);
     SendGossipMenuFor(player, PET_GOSSIP_BROWSE, creature->GetGUID());
   } else if (action >= PET_PAGE_START_EXOTIC_PETS &&
              action < PET_PAGE_START_RARE_PETS) {
